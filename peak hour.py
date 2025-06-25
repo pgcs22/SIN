@@ -27,7 +27,7 @@ for origem, destino in conexoes:
                 r=276*1.5,
                 )
 try:
-    df_geracao = pd.read_excel("dados por subsistema.xlsx", index_col=0)
+    df_geracao = pd.read_excel("dados por subsistema 2.xlsx", index_col=0)
 
     # 4. Adicionar barramentos de geração para cada tipo em cada subsistema
     tipos_geracao = df_geracao.index.tolist()
@@ -65,10 +65,10 @@ except FileNotFoundError:
     print("Arquivo 'dados por subsistema.xlsx' não encontrado. Criando rede apenas com barramentos principais.")
 
 cargas = {
-    'N': 8332.032,
-    'NE': 14887.94,
-    'S': 20281.776,
-    'SE/CO': 60837.617
+    'N': 7979.966,
+    'NE': 1514.118,
+    'S': 18348.577,
+    'SE/CO': 57590.606
 }
 
 for subsis, carga in cargas.items():
@@ -87,7 +87,7 @@ p_gen = network.generators_t.p
 p_load = network.loads_t.p
 
 # Cria um arquivo Excel com várias abas
-with pd.ExcelWriter("fluxo_de_potencia.xlsx") as writer:
+with pd.ExcelWriter("fluxo_de_potencia 19.xlsx") as writer:
     v_mag.to_excel(writer, sheet_name="Tensão Magnitude")
     v_ang.to_excel(writer, sheet_name="Tensão Ângulo")
     p0.to_excel(writer, sheet_name="Fluxo Ativo Linhas")

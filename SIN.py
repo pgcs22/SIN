@@ -2,10 +2,13 @@ import pypsa
 import pandas as pd
 import numpy as np
 import geopandas as gpd
-from shapely.geometry import Point, LineString
+import networkx as nx
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+from shapely.geometry import Point, LineString, MultiLineString
 import re
 
-# o objetivo desse código é modelar o SIN no PyPSA. Primeiro passo é carregar os ativos
+
 def carregar_LTs():
     try:
         # Linhas de transmissão
@@ -24,36 +27,71 @@ def carregar_LTs():
         linhas_completas = pd.concat([linhas_atuais, linhas_futuras], ignore_index=True)
         linhas_completas = linhas_completas.drop(['Ano_Opera', 'created_da', 'last_edite', 'last_edi_1'], axis=1)
 
+        linhas_completas.to_excel('linhas.xlsx')
+
         return linhas_completas
 
     except Exception as e:
         print(f"Erro ao carregar arquivos shapefile: {e}")
         exit()
 
-def carregar_SEs():
-    try:
-        # Subestações
-        SEs_atuais = gpd.read_file(
-            r"C:\Users\pgcs_\PycharmProjects\PyPSA\raw\Subestações___Base_Existente.shp"
-        )
-        SEs_futuras = gpd.read_file(
-            r"C:\Users\pgcs_\PycharmProjects\PyPSA\raw\Subestações___Expansão_Planejada.shp"
-        )
+def extrair_pontos_referencia(gdf_linhas):
+    """
+    Extrai pontos de origem e destino de geometrias LineString/MultiLineString.
 
-        # Adiciona uma coluna para identificar se a linha é atual ou futura (opcional)
-        SEs_atuais['tipo'] = 'existente'
-        SEs_futuras['tipo'] = 'planejada'
+    Args:
+        gdf_linhas (GeoDataFrame): GeoDataFrame contendo linhas de transmissão
 
-        # Junta os dois GeoDataFrames
-        SEs_completas = pd.concat([SEs_atuais, SEs_futuras], ignore_index=True)
-        SEs_completas = SEs_completas.drop(['Ano_Opera'], axis=1)
+    Returns:
+        GeoDataFrame: Novo GeoDataFrame com colunas 'origem_geom' e 'destino_geom' contendo pontos
+    """
 
-        return SEs_completas
+    # Verifica se o GeoDataFrame tem geometria
+    if not isinstance(gdf_linhas, gpd.GeoDataFrame):
+        raise TypeError("A entrada deve ser um GeoDataFrame")
 
-    except Exception as e:
-        print(f"Erro ao carregar arquivos shapefile: {e}")
-        exit()
+    if 'geometry' not in gdf_linhas.columns:
+        raise ValueError("O GeoDataFrame deve ter uma coluna 'geometry'")
 
+    # Cria cópia para não modificar o original
+    gdf = gdf_linhas.copy()
+
+    # Cria colunas para os pontos
+    gdf['origem_geom'] = None
+    gdf['destino_geom'] = None
+
+    for idx, row in gdf.iterrows():
+        geom = row.geometry
+
+        # Caso LineString simples
+        if isinstance(geom, LineString):
+            coords = list(geom.coords)
+            if len(coords) >= 2:
+                gdf.at[idx, 'origem_geom'] = Point(coords[0])
+                gdf.at[idx, 'destino_geom'] = Point(coords[-1])
+
+        # Caso MultiLineString
+        elif isinstance(geom, MultiLineString):
+            # Pega a primeira coordenada da primeira linha e última da última linha
+            first_line = geom.geoms[0]
+            last_line = geom.geoms[-1]
+
+            first_coords = list(first_line.coords)
+            last_coords = list(last_line.coords)
+
+            if first_coords and last_coords:
+                gdf.at[idx, 'origem_geom'] = Point(first_coords[0])
+                gdf.at[idx, 'destino_geom'] = Point(last_coords[-1])
+
+        # Caso geometria inválida
+        else:
+            print(f"Aviso: Geometria não suportada na linha {idx} - {type(geom)}")
+
+    # Converte para GeoDataFrame as novas colunas de geometria
+    gdf.set_geometry('origem_geom', inplace=True)
+    gdf['destino_geom'] = gpd.GeoSeries(gdf['destino_geom'])
+
+    return gdf
 
 def carregar_Geracao():
     try:
@@ -84,441 +122,772 @@ def carregar_Geracao():
                 # Padroniza os nomes das colunas
                 gdf.columns = [colunas_padrao.get(col, col) for col in gdf.columns]
 
+                # Adiciona coluna com a fonte original (opcional)
+                if fonte == 'EOL':
+                    gdf['fonte_original'] = 'UEE'
+                elif 'UTE' in str(fonte).upper():
+                    gdf['fonte_original'] = 'UTE'
+                else:
+                    gdf['fonte_original'] = fonte
+
                 if op == 'Base_Existente':
                     gdf['ini_oper'] = gdf['ini_oper'].replace(['-', 0.0], np.nan)
 
                 # Colunas para remover (usando nomes padronizados)
-                cols_to_drop = ['Shape_STLe', 'created_da', 'created_us', 'last_edite', 'last_edi_1', 'combust', 'COMBUST', 'Rio', ' Leilao', 'ano_prev', 'CEG', 'Leilão', 'leilao']
+                cols_to_drop = ['Shape_STLe', 'created_da', 'created_us', 'last_edite', 'last_edi_1', 'combust',
+                                'COMBUST', 'Rio', ' Leilao', 'ano_prev', 'CEG', 'Leilão', 'leilao']
                 gdf = gdf.drop(columns=[col for col in cols_to_drop if col in gdf.columns], errors='ignore')
 
                 geradores.append(gdf)
 
         # Concatena todos os DataFrames
         gdf_final = pd.concat(geradores, axis=0).reset_index(drop=True)
-        gdf_final['potencia'] = gdf_final['potencia'] / 1e3  # Convertendo para MW
 
+        # Converte a potência para MW
+        gdf_final['potencia'] = gdf_final['potencia'] / 1e3
+
+        # Filtra apenas geradores com potência >= 10 MW (APÓS a conversão)
+        gdf_final = gdf_final[gdf_final['potencia'] >= 10]
+
+        # Adiciona coluna de subsistema baseado nas coordenadas
+        gdf_final['subsistema'] = None
+
+        # Classifica cada gerador em um subsistema
+        for idx, row in gdf_final.iterrows():
+            if isinstance(row.geometry, Point):
+                lat = row.geometry.y
+                lon = row.geometry.x
+
+                if lat < -20:  # Sul
+                    gdf_final.at[idx, 'subsistema'] = 'S'
+                elif -20 <= lat <= -10 and lon > -50:  # Sudeste/Centro-Oeste
+                    gdf_final.at[idx, 'subsistema'] = 'SE/CO'
+                elif lat > -10 and lon > -40:  # Nordeste
+                    gdf_final.at[idx, 'subsistema'] = 'NE'
+                else:  # Norte
+                    gdf_final.at[idx, 'subsistema'] = 'N'
+            else:
+                print(f"Gerador {idx} não tem geometria Point válida")
+
+        gdf_final.to_excel('geração.xlsx')
         return gdf_final
 
     except Exception as e:
         print(f"Erro ao carregar arquivos shapefile: {e}")
-        raise  # Melhor que exit() para permitir tratamento do erro
-
-
-def conectar_linhas_subestacoes(linhas, subestacoes, geradores):
-    """
-    Conecta as linhas de transmissão às subestações de origem e destino
-
-    Args:
-        linhas: GeoDataFrame com as linhas de transmissão
-        subestacoes: GeoDataFrame com as subestações
-        geradores: GeoDataFrame com as unidades de geração
-
-    Returns:
-        GeoDataFrame com as linhas de transmissão conectadas às SEs
-    """
-    try:
-        # 1. Converter para CRS projetado adequado (ex: UTM 23S para Brasil - EPSG:31983)
-        CRS_PROJETADO = "EPSG:31983"  # UTM 23S (SIRGAS 2000)
-
-        # Verificar e converter CRS
-        if subestacoes.crs is None:
-            subestacoes = subestacoes.set_crs("EPSG:4326")
-        subestacoes = subestacoes.to_crs(CRS_PROJETADO)
-
-        linhas = linhas.to_crs(CRS_PROJETADO)
-        geradores = geradores.to_crs(CRS_PROJETADO)
-
-        # 2. Padronizar colunas
-        def padronizar_colunas(gdf):
-            mapeamento = {
-                'nome': ['nome', 'NOME', 'Nome', 'name', 'NAME'],
-                'geometry': ['geometry', 'geom', 'GEOMETRY']
-            }
-            for padrao, alternativas in mapeamento.items():
-                for alt in alternativas:
-                    if alt in gdf.columns:
-                        gdf = gdf.rename(columns={alt: padrao})
-                        break
-            return gdf
-
-        subestacoes = padronizar_colunas(subestacoes)
-        geradores = padronizar_colunas(geradores)
-
-        # 3. Combinar pontos de conexão
-        pontos_conexao = pd.concat([
-            subestacoes[['nome', 'geometry']],
-            geradores[['nome', 'geometry']]
-        ], ignore_index=True)
-
-        # 4. Função para extrair pontos de extremidade
-        def extrair_pontos_extremidade(geom):
-            if geom.geom_type == 'LineString':
-                return Point(geom.coords[0]), Point(geom.coords[-1])
-            elif geom.geom_type == 'MultiLineString':
-                # Pega o primeiro ponto da primeira linha e último ponto da última linha
-                all_coords = []
-                for line in geom.geoms:
-                    all_coords.extend(line.coords)
-                return Point(all_coords[0]), Point(all_coords[-1])
-            else:
-                raise ValueError(f"Tipo de geometria não suportado: {geom.geom_type}")
-
-        # 5. Encontrar conexões
-        linhas_conectadas = linhas.copy()
-
-        # Listas para armazenar resultados
-        se_origem_list = []
-        se_destino_list = []
-        dist_origem_list = []
-        dist_destino_list = []
-
-        for idx, linha in linhas.iterrows():
-            try:
-                pt_origem, pt_destino = extrair_pontos_extremidade(linha.geometry)
-
-                # Calcular distâncias
-                dist_origem = pontos_conexao.distance(pt_origem)
-                dist_destino = pontos_conexao.distance(pt_destino)
-
-                # Encontrar pontos mais próximos
-                idx_origem = dist_origem.idxmin()
-                idx_destino = dist_destino.idxmin()
-
-                # Obter nomes
-                nome_origem = pontos_conexao.iloc[idx_origem].get('nome',
-                                                                  pontos_conexao.iloc[idx_origem].get('nome_gerador',
-                                                                                                      None))
-                nome_destino = pontos_conexao.iloc[idx_destino].get('nome',
-                                                                    pontos_conexao.iloc[idx_destino].get('nome_gerador',
-                                                                                                         None))
-
-                # Armazenar resultados
-                se_origem_list.append(nome_origem)
-                se_destino_list.append(nome_destino)
-                dist_origem_list.append(dist_origem.min())
-                dist_destino_list.append(dist_destino.min())
-
-            except Exception as e:
-                print(f"Erro na linha {idx}: {str(e)}")
-                se_origem_list.append(None)
-                se_destino_list.append(None)
-                dist_origem_list.append(None)
-                dist_destino_list.append(None)
-
-        # Adicionar colunas ao DataFrame
-        linhas_conectadas['SE_origem'] = se_origem_list
-        linhas_conectadas['SE_destino'] = se_destino_list
-        linhas_conectadas['dist_origem'] = dist_origem_list
-        linhas_conectadas['dist_destino'] = dist_destino_list
-
-        # 6. Verificar conexões problemáticas
-        limite_dist = 100  # 100 metros (em CRS projetado)
-        problemas = linhas_conectadas[
-            (linhas_conectadas['SE_origem'].isna()) |
-            (linhas_conectadas['SE_destino'].isna()) |
-            (linhas_conectadas['dist_origem'] > limite_dist) |
-            (linhas_conectadas['dist_destino'] > limite_dist)
-            ]
-
-        if not problemas.empty:
-            print(f"\nAviso: {len(problemas)} linhas com problemas de conexão")
-            print(f"Distância máxima de origem: {problemas['dist_origem'].max():.2f} metros")
-            print(f"Distância máxima de destino: {problemas['dist_destino'].max():.2f} metros")
-
-        return linhas_conectadas.to_crs("EPSG:4326")  # Retornar para WGS84 se necessário
-
-    except Exception as e:
-        print(f"Erro ao conectar linhas: {str(e)}")
         raise
 
-
-import pypsa
-import numpy as np
-import re
-
-
-def adicionar_subestacoes(network, subestacoes_gdf):
+def processar_nome_lt(nome_lt):
     """
-    Adiciona subestações como barramentos na rede PyPSA, tratando subestações
-    com múltiplas tensões (elevadoras/rebaixadoras).
-
-    Args:
-        network: Objeto PyPSA Network
-        subestacoes_gdf: GeoDataFrame com as subestações
-                         Deve conter colunas 'nome' e 'tensao'
-                         Exemplo de tensão: "138/69/13.8" (kV)
-    """
-    # Expressão regular para extrair tensões
-    padrao_tensao = re.compile(r'(\d+\.?\d*)\/?')
-
-    for _, sub in subestacoes_gdf.iterrows():
-        nome_se = sub['Nome']
-        tensoes = padrao_tensao.findall(str(sub['Tensao']))
-
-        # Converter para float e multiplicar por kV -> V
-        tensoes_kV = [float(t) for t in tensoes if t]
-        tensoes_V = [t * 1e3 for t in tensoes_kV]
-
-        if not tensoes_V:
-            print(f"Aviso: Subestação {nome_se} sem tensão definida. Pulando.")
-            continue
-
-        # Caso de subestação simples (uma tensão)
-        if len(tensoes_V) == 1:
-            if nome_se not in network.buses.index:
-                network.add("Bus",
-                            name=nome_se,
-                            v_nom=tensoes_V[0],
-                            x=sub.geometry.x,
-                            y=sub.geometry.y)
-
-        # Caso de subestação com múltiplas tensões
-        else:
-            for i, tensao in enumerate(tensoes_V):
-                # Nome do barramento: "SE_NOME_NIVELi"
-                nome_bus = f"{nome_se}_NIVEL{i + 1}"
-
-                if nome_bus not in network.buses.index:
-                    network.add("Bus",
-                                name=nome_bus,
-                                v_nom=tensao,
-                                x=sub.geometry.x,
-                                y=sub.geometry.y)
-
-                # Adicionar transformadores entre os níveis (se não for o primeiro)
-                if i > 0:
-                    nome_trafo = f"Trafo_{nome_se}_{i}-{i + 1}"
-
-                    if nome_trafo not in network.transformers.index:
-                        # Parâmetros típicos de transformador
-                        snom = 100  # MVA
-                        perdas = 0.005  # 0.5%
-
-                        network.add("Transformer",
-                                    name=nome_trafo,
-                                    bus0=f"{nome_se}_NIVEL{i}",
-                                    bus1=f"{nome_se}_NIVEL{i + 1}",
-                                    s_nom=snom,
-                                    x=0.1,  # Reatância
-                                    r=perdas,  # Resistência
-                                    tap_ratio=1.0,
-                                    phase_shift=0)
-
-    # Verificar barramentos criados (corrigido)
-    print(f"\nResumo da rede:")
-    print(f"- Total de barramentos: {len(network.buses)}")
-    print(f"- Total de transformadores: {len(network.transformers)}")
-
-    # Listar subestações com múltiplas tensões
-    print("\nSubestações com múltiplas tensões:")
-    for bus in network.buses.index[network.buses.index.str.contains('_NIVEL')]:
-        v_nom = network.buses.at[bus, 'v_nom']
-        print(f"- {bus} ({v_nom / 1e3} kV)")
-
-
-def adicionar_geradores_completo(network, geradores_gdf, linhas_conectadas, subestacoes_gdf):
-    """
-    Adiciona geradores à rede PyPSA considerando:
-    - Subestações com múltiplos níveis de tensão
-    - Conexão de geradores no nível mais baixo
-    - Verificação completa de inserção
+    Processa o nome de uma Linha de Transmissão (LT) ou Ramal.
+    Versão melhorada que trata múltiplos destinos (ramais).
 
     Retorna:
-        - network: Rede PyPSA modificada
-        - report: Dicionário com detalhes de inserção
+    - origem_processada: str
+    - destinos: list de str (pode ter 1 ou 2 destinos)
     """
-    # 1. Configuração inicial
-    CRS_PROJETADO = "EPSG:31983"  # UTM 23S para Brasil
-    geradores_gdf = geradores_gdf.to_crs(CRS_PROJETADO)
-    linhas_conectadas = linhas_conectadas.to_crs(CRS_PROJETADO)
-    subestacoes_gdf = subestacoes_gdf.to_crs(CRS_PROJETADO)
+    if not nome_lt or pd.isna(nome_lt):
+        return None, None
 
-    report = {
-        'total_geradores': len(geradores_gdf),
-        'inseridos': set(),
-        'nao_inseridos': set(),
-        'erros': {},
-        'conexoes_por_nivel': {}
-    }
+    try:
+        # 1. Separar origem e destinos
+        partes = nome_lt.split(' - ')
+        if len(partes) < 2:
+            return None, None
 
-    # 2. Pré-processamento de subestações multi-nível
-    def encontrar_nivel_mais_baixo(se_base):
-        """Encontra o barramento com menor tensão para uma SE"""
-        niveis = [bus for bus in network.buses.index
-                  if bus.startswith(f"{se_base}_NIVEL")]
+        origem = partes[0]
+        destinos = partes[1:]
 
-        if not niveis:
-            return se_base  # SE sem múltiplos níveis
+        # 2. Processar origem: remover tudo antes do kV (incluindo kV)
+        indice_kv = origem.rfind('kV')
+        origem_processada = origem[indice_kv + 2:].strip() if indice_kv != -1 else origem.strip()
 
-        # Encontrar nível com menor tensão
-        niveis_com_tensao = [
-            (bus, network.buses.at[bus, 'v_nom'])
-            for bus in niveis
-        ]
-        return min(niveis_com_tensao, key=lambda x: x[1])[0]
+        # 3. Processar cada destino
+        destinos_processados = []
+        for destino in destinos:
+            # Remove (CD) ou similar
+            destino = re.sub(r'\(.*?\)', '', destino).strip()
 
-    # 3. Identificar geradores origem
-    geradores_origem = {
-        str(linha['SE_origem']).strip()
-        for _, linha in linhas_conectadas.iterrows()
-        if isinstance(linha['SE_origem'], str)
-           and not linha['SE_origem'].startswith('SE ')
-    }
+            # Remove conteúdo após a última vírgula (se houver)
+            if ',' in destino:
+                destino = destino.split(',')[0].strip()
 
-    # 4. Processar cada gerador
-    for _, gerador in geradores_gdf.iterrows():
-        nome_ger = str(gerador['nome']).strip()
+            # Remove C e números no final (ex: C2)
+            destino = re.sub(r' C\d+$', '', destino).strip()
+
+            if destino:  # Só adiciona se não for vazio
+                destinos_processados.append(destino)
+
+        # Retorna a origem e uma lista de destinos (pode ter 1 ou 2 elementos)
+        return origem_processada, destinos_processados if destinos_processados else None
+
+    except Exception as e:
+        print(f"Erro ao processar '{nome_lt}': {e}")
+        return None, None
+
+def classificar_subestacao(nome):
+    """
+    Classifica e formata um nome de origem/destino.
+    Agora também aceita lista de nomes.
+    """
+    if isinstance(nome, list):
+        return [classificar_subestacao(n) for n in nome if n]
+
+    if not nome or pd.isna(nome):
+        return None
+
+    nome = str(nome).strip()
+    nome = nome.replace(',', '').strip()
+
+    if any(nome.startswith(prefix) for prefix in ['PCH', 'CGH', 'UEE', 'UFV', 'UHE', 'UTE']):
+        return nome
+    else:
+        if nome and not nome.startswith('SE '):
+            return f"SE {nome}"
+        return nome
+
+def processar_linhas_e_atualizar_rede(rede_pypsa, gdf_linhas):
+    """
+    Processa as linhas de transmissão e atualiza a rede PyPSA com visualização passo a passo.
+    Versão que plota cada linha adicionada para verificar as conexões.
+    """
+
+    gdf_linhas['origem_processada'] = None
+    gdf_linhas['destinos_processados'] = None
+    gdf_linhas['conexoes'] = None
+
+
+
+    for idx, row in gdf_linhas.iterrows():
         try:
-            # Encontrar SE mais próxima
-            pt_gerador = Point(gerador.geometry.x, gerador.geometry.y)
-            distancias = subestacoes_gdf.geometry.distance(pt_gerador)
-            se_proxima = subestacoes_gdf.iloc[distancias.idxmin()]
-            nome_se_base = str(se_proxima['Nome']).strip()
+            # Processar nome da LT
+            origem, destinos = processar_nome_lt(row['Nome'])
+            origem_classificada = classificar_subestacao(origem) if origem else None
+            destinos_classificados = [classificar_subestacao(d) for d in destinos] if destinos else []
 
-            # Determinar barramento de conexão (nível mais baixo)
-            barramento_conexao = encontrar_nivel_mais_baixo(nome_se_base)
+            # Armazenar resultados
+            gdf_linhas.at[idx, 'origem_processada'] = origem_classificada
+            gdf_linhas.at[idx, 'destinos_processados'] = destinos_classificados
 
-            if barramento_conexao not in network.buses.index:
-                report['nao_inseridos'].add(nome_ger)
-                report['erros'][nome_ger] = f"Barramento {barramento_conexao} não encontrado"
-                continue
+            # Adicionar barramentos
+            if origem_classificada:
+                tensao_linha = row['Tensao']
+                posicao_origem = row['origem_geom']
+                posicao_destino = row['destino_geom']
 
-            tensao = network.buses.at[barramento_conexao, 'v_nom']
-            potencia = float(gerador['potencia']) * 1e6  # MW → W
+                if not barramento_existe(rede_pypsa, origem_classificada, tensao_linha, posicao_origem):
+                    adicionar_barramento(rede_pypsa, origem_classificada, tensao_linha,
+                                         is_geradora(origem_classificada), posicao_origem)
 
-            # Registrar nível de tensão usado
-            nivel = barramento_conexao.split('_NIVEL')[-1] if '_NIVEL' in barramento_conexao else '0'
-            report['conexoes_por_nivel'][nome_ger] = {
-                'barramento': barramento_conexao,
-                'tensao_kV': tensao / 1e3,
-                'nivel': nivel
-            }
+                for i, destino_classificado in enumerate(destinos_classificados):
+                    if destino_classificado:
+                        pos_dest = posicao_destino[i] if isinstance(posicao_destino, (list, tuple)) else posicao_destino
+                        if not barramento_existe(rede_pypsa, destino_classificado, tensao_linha, pos_dest):
+                            adicionar_barramento(rede_pypsa, destino_classificado, tensao_linha,
+                                                 is_geradora(destino_classificado), pos_dest)
 
-            # Caso 1: Gerador é origem de linha
-            if nome_ger in geradores_origem:
-                nome_bus = f"BUS_{nome_ger.replace(' ', '_')}"
+            # Determinar conexões
+            conexoes = determinar_conexoes_lt(rede_pypsa, origem_classificada, destinos_classificados, row['Tensao'])
+            gdf_linhas.at[idx, 'conexoes'] = conexoes
 
-                if nome_bus not in network.buses.index:
-                    network.add("Bus",
-                                name=nome_bus,
-                                v_nom=tensao,
-                                x=gerador.geometry.x,
-                                y=gerador.geometry.y)
+            if conexoes:
+                comprimento_total = float(row['Extensao']) if 'Extensao' in row else 1.0
+                comprimento_por_trecho = comprimento_total / len(conexoes) if len(conexoes) > 1 else comprimento_total
 
-                network.add("Generator",
-                            name=nome_ger,
-                            bus=nome_bus,
-                            p_nom=potencia,
-                            **{k: v for k, v in gerador.items()
-                               if k not in ['geometry', 'nome'] and pd.notna(v)})
+                for i, (bus0, bus1) in enumerate(conexoes):
+                    nome_linha = f"{row['Nome']}_trecho_{i + 1}" if len(conexoes) > 1 else row['Nome']
 
-                network.add("Line",
-                            name=f"LIG_{nome_ger.replace(' ', '_')}",
-                            bus0=nome_bus,
-                            bus1=barramento_conexao,
-                            length=0.1,
-                            type="NA2XS2Y 1x240 RM/25 12.0")
+                    # Adicionar linha à rede
+                    inserir_lt(rede_pypsa, nome_linha, bus0, bus1, row['Tensao'], comprimento_por_trecho)
 
-            # Caso 2: Gerador normal
-            else:
-                network.add("Generator",
-                            name=nome_ger,
-                            bus=barramento_conexao,
-                            p_nom=potencia,
-                            **{k: v for k, v in gerador.items()
-                               if k not in ['geometry', 'nome'] and pd.notna(v)})
 
-            report['inseridos'].add(nome_ger)
 
         except Exception as e:
-            report['nao_inseridos'].add(nome_ger)
-            report['erros'][nome_ger] = str(e)
+            print(f"Erro ao processar linha {idx} ('{row['Nome']}'): {e}")
             continue
 
-    # 5. Verificação final e relatório
-    geradores_na_rede = set(network.generators.index)
-    for nome_ger in geradores_gdf['nome'].str.strip():
-        if nome_ger not in geradores_na_rede and nome_ger not in report['nao_inseridos']:
-            report['nao_inseridos'].add(nome_ger)
-            report['erros'][nome_ger] = "Não inserido (razão desconhecida)"
 
-    print("\n" + "=" * 50)
-    print("RELATÓRIO DE INSERÇÃO DE GERADORES")
-    print(f"Total processado: {report['total_geradores']}")
-    print(f"Inseridos com sucesso: {len(report['inseridos'])}")
-    print(f"Não inseridos: {len(report['nao_inseridos'])}")
+    # Salvar resultados
+    rede_pypsa.buses.to_excel('SEs_Inseridas.xlsx')
+    rede_pypsa.loads.to_excel('Cargas_Inseridas.xlsx')
+    rede_pypsa.lines.to_excel('linhas_inseridas.xlsx')
+    gdf_linhas.to_excel('linhas_processadas.xlsx')
 
-    if report['nao_inseridos']:
-        print("\nDetalhes dos geradores não inseridos:")
-        for gerador in sorted(report['nao_inseridos']):
-            print(f"- {gerador}: {report['erros'].get(gerador, 'Erro não especificado')}")
+    return gdf_linhas, rede_pypsa
 
-    print("\nDistribuição por níveis de tensão:")
-    dist_niveis = pd.DataFrame.from_dict(report['conexoes_por_nivel'], orient='index')
-    print(dist_niveis['nivel'].value_counts().sort_index())
-
-    print("=" * 50 + "\n")
-
-    return network, report
-
-def verificar_conexoes_se(linhas_conectadas, subestacoes_gdf):
+def determinar_conexoes_lt(network, origem, destinos, tensao):
     """
-    Verifica se todas as SEs de origem e destino das linhas existem no DataFrame de subestações.
+    Determina os pares de barramentos que uma linha de transmissão deve conectar.
 
     Args:
-        linhas_conectadas: GeoDataFrame com as linhas de transmissão conectadas
-        subestacoes_gdf: GeoDataFrame com as subestações
+        network: Rede PyPSA
+        origem: Nome da subestação de origem (str)
+        destinos: Lista de nomes de subestações de destino (list[str])
+        tensao: Tensão nominal da linha (float)
 
     Returns:
-        Tuple: (bool indicando sucesso, DataFrame com linhas problemáticas)
+        Lista de tuplas (barramento_origem, barramento_destino) que devem ser conectados
     """
-    # 1. Extrair nomes únicos de subestações válidas
-    se_validas = set(subestacoes_gdf['Nome'].unique())
+    conexoes = []
 
-    # 2. Verificar cada linha
-    problemas = []
-    for idx, linha in linhas_conectadas.iterrows():
-        origem_ok = pd.isna(linha['SE_origem']) or (linha['SE_origem'] in se_validas)
-        destino_ok = pd.isna(linha['SE_destino']) or (linha['SE_destino'] in se_validas)
+    # Verifica se temos destinos válidos
+    if not destinos or len(destinos) == 0:
+        return conexoes
 
-        if not (origem_ok and destino_ok):
-            problemas.append({
-                'id_linha': idx,
-                'SE_origem': linha['SE_origem'],
-                'SE_destino': linha['SE_destino'],
-                'problema': 'SE_origem não encontrada' if not origem_ok else 'SE_destino não encontrada'
-            })
+    # Obtém todos os barramentos da rede
+    buses = network.buses
 
-    # 3. Criar DataFrame de problemas
-    df_problemas = pd.DataFrame(problemas)
+    # 1. Encontra o barramento de origem correto
+    barramento_origem = None
 
-    # 4. Retornar resultado
-    if len(df_problemas) > 0:
-        print(f"\nAviso: {len(df_problemas)} linhas com problemas de conexão:")
-        print(df_problemas[['id_linha', 'SE_origem', 'SE_destino', 'problema']])
-        return False, df_problemas
+    # Primeiro tenta encontrar por nome e tensão
+    mask_origem = (buses['substation'] == origem) & (buses['v_nom'] == tensao)
+    if mask_origem.any():
+        barramento_origem = buses[mask_origem].index[0]
+
+    # Se não encontrou, tenta encontrar por proximidade geográfica (se implementado)
+    # ...
+
+    if barramento_origem is None:
+        print(f"Barramento de origem não encontrado: {origem} {tensao}kV")
+        return conexoes
+
+    # 2. Para cada destino, encontra o barramento correspondente
+    barramentos_destino = []
+
+    for destino in destinos:
+        mask_destino = (buses['substation'] == destino) & (buses['v_nom'] == tensao)
+        if mask_destino.any():
+            barramentos_destino.append(buses[mask_destino].index[0])
+        else:
+            print(f"Barramento de destino não encontrado: {destino} {tensao}kV")
+            barramentos_destino.append(None)
+
+    # 3. Determina os pares de conexão conforme o número de destinos
+    if len(barramentos_destino) == 1:
+        # Caso simples: origem -> destino1
+        if barramentos_destino[0] is not None:
+            conexoes.append((barramento_origem, barramentos_destino[0]))
     else:
-        print("Todas as conexões estão válidas!")
-        return True, None
+        # Caso ramal: origem -> destino1 -> destino2
+        for i in range(len(barramentos_destino)):
+            if i == 0:
+                # Primeira conexão: origem -> destino1
+                if barramentos_destino[i] is not None:
+                    conexoes.append((barramento_origem, barramentos_destino[i]))
+            else:
+                # Conexões subsequentes: destino anterior -> destino atual
+                if barramentos_destino[i - 1] is not None and barramentos_destino[i] is not None:
+                    conexoes.append((barramentos_destino[i - 1], barramentos_destino[i]))
 
-CRS_PROJETADO = "EPSG:31983"  # UTM 23S para Brasil
+    return conexoes
+
+def barramento_existe(rede, nome, v_nom, ponto_referencia=None, distancia_maxima=0.00001):
+    """
+    Verifica se um barramento existe, agora suportando lista de nomes.
+    """
+    if isinstance(nome, list):
+        return any(barramento_existe(rede, n, v_nom, ponto_referencia, distancia_maxima) for n in nome)
+
+    buses = rede.buses
+
+    if is_geradora(nome): return False
+
+    # Verificação por nome e tensão
+    if nome is not None:
+        existe_por_nome = ((buses['substation'] == nome) & (buses['v_nom'] == v_nom)).any()
+        if existe_por_nome:
+            return True
+    return False
+
+def is_geradora(nome):
+    """Verifica se o nome corresponde a uma geradora (UEE, UHE ou UTE)"""
+    if not isinstance(nome, str):
+        return False
+    return nome.startswith(('UEE', 'UHE', 'UTE'))
+
+def adicionar_barramento(rede, nome, v_nom, is_geradora, posicao):
+    """Adiciona um barramento à rede PyPSA"""
+    # Adiciona o barramento
+    rede.add("Bus",
+             name=f"{nome} V_{v_nom}",
+             v_nom=v_nom,
+             v_mag_pu_set = 1,
+             substation=nome,  # Armazena apenas o nome base
+             geometry=posicao)
+
+def inserir_lt(rede, nome, origem, destino, v_nom, extensao):
+    if v_nom == 230:
+        rede.add('Line',
+                 name=nome,
+                 bus0=origem,
+                 bus1=destino,
+                 s_nom=10000,
+                 v_nom = v_nom,
+                 x=0.35 * extensao,
+                 r=0.05 * extensao,
+                 g=0,  # Desprezível
+                 b=3.2e-6 * extensao,
+                 length= extensao,
+                 num_parallel=5)
+    elif v_nom== 345:
+        rede.add('Line',
+                 name=nome,
+                 bus0=origem,
+                 bus1=destino,
+                 s_nom=10000,
+                 v_nom=v_nom,
+                 x=0.3 * extensao,
+                 r=0.04 * extensao,
+                 g=0,  # Desprezível
+                 b=3.8e-6 * extensao,
+                 length=extensao,
+                 num_parallel=5)
+    elif v_nom==440:
+        rede.add('Line',
+                 name=nome,
+                 bus0=origem,
+                 bus1=destino,
+                 s_nom=10000,
+                 v_nom=v_nom,
+                 x=0.25 * extensao,
+                 r=0.03 * extensao,
+                 g=0,  # Desprezível
+                 b=4.5e-6 * extensao,
+                 length=extensao,
+                 num_parallel=5)
+    elif v_nom==500:
+        rede.add('Line',
+                 name=nome,
+                 bus0=origem,
+                 bus1=destino,
+                 s_nom=10000,
+                 v_nom=v_nom,
+                 x=0.2 * extensao,
+                 r=0.015 * extensao,
+                 g=0,  # Desprezível
+                 b=5.0e-6 * extensao,
+                 length=extensao,
+                 num_parallel=5)
+    elif v_nom==525:
+        rede.add('Line',
+                 name=nome,
+                 bus0=origem,
+                 bus1=destino,
+                 s_nom=10000,
+                 v_nom=v_nom,
+                 x=0.18 * extensao,
+                 r=0.012 * extensao,
+                 g=0,  # Desprezível
+                 b=5.3e-6 * extensao,
+                 length=extensao,
+                 num_parallel=5)
+    else:
+        rede.add('Line',
+                 name=nome,
+                 bus0=origem,
+                 bus1=destino,
+                 s_nom=10000,
+                 v_nom=v_nom,
+                 x=0.000001 * extensao,
+                 r=0.0022 * extensao,
+                 g=0,  # Desprezível
+                 b=1.0e-6 * extensao,
+                 length=extensao,
+                 num_parallel=5)
+
+def conectar_geradores_a_rede(rede_pypsa, gdf_geradores):
+    """
+    Conecta geradores à rede PyPSA usando barramentos existentes.
+    Se já existir gerador no barramento, cria novo barramento e conecta com transformador.
+
+    Parâmetros:
+    ----------
+    rede_pypsa : pypsa.Network
+        Rede PyPSA existente
+    gdf_geradores : geopandas.GeoDataFrame
+        Deve conter colunas:
+        - nome: Nome do gerador
+        - geometry: Posição geográfica (Point)
+        - fonte_original: Tipo (UHE, UTE, UEE)
+        - potencia: Potência nominal (MW)
+
+    Retorna:
+    -------
+    pypsa.Network
+        Rede com geradores adicionados
+    """
+
+    # Verificação de colunas obrigatórias
+    required_cols = {'nome', 'geometry', 'fonte_original', 'potencia'}
+    if not required_cols.issubset(gdf_geradores.columns):
+        missing = required_cols - set(gdf_geradores.columns)
+        raise ValueError(f"Faltam colunas: {missing}")
+
+    # Filtrar apenas UHE, UTE, UEE
+    tipos_validos = ['UHE', 'UTE', 'UEE', 'PCH', 'UFV']
+    gdf_filtrado = gdf_geradores[gdf_geradores['fonte_original'].isin(tipos_validos)].copy()
+
+    if gdf_filtrado.empty:
+        print("Nenhum gerador do tipo UHE, UTE ou UEE encontrado.")
+        return rede_pypsa
+
+    # Pré-processamento: Criar lista de barramentos com geometria
+    buses_with_geom = rede_pypsa.buses[rede_pypsa.buses.geometry.notnull()].copy()
+
+    for idx, gerador in gdf_filtrado.iterrows():
+        try:
+            nome = str(gerador['nome']).strip()
+            fonte = str(gerador['fonte_original']).strip()
+            potencia = float(gerador['potencia'])
+            geom_gerador = gerador['geometry']
+            subsist = gerador['subsistema']
+
+            # 1. Tentar encontrar barramento onde substation == nome do gerador
+            bus_candidato = None
+
+            # Verificar se há barramento com substation igual ao nome do gerador
+            if 'substation' in rede_pypsa.buses.columns:
+                mask = rede_pypsa.buses['substation'] == nome
+                if mask.any():
+                    bus_candidato = rede_pypsa.buses[mask].index[0]
+
+            # 2. Se não encontrou, verificar se há barramento com nome exato do gerador
+            if bus_candidato is None and nome in rede_pypsa.buses.index:
+                bus_candidato = nome
+
+            # 3. Se ainda não encontrou, procurar barramento mais próximo
+            if bus_candidato is None and isinstance(geom_gerador, Point) and not buses_with_geom.empty:
+                # Calcular distâncias para todos os barramentos
+                distancias = buses_with_geom.geometry.apply(
+                    lambda x: geom_gerador.distance(x) if isinstance(x, Point) else float('inf'))
+
+                if not distancias.empty:
+                    idx_proximo = distancias.idxmin()
+                    if distancias[idx_proximo] < 10:  # 10km de tolerância
+                        bus_candidato = idx_proximo
+
+            if bus_candidato is None:
+                print(f"Nenhum barramento adequado encontrado para {nome} - gerador não conectado")
+                continue
+
+            # Verificar se já existe gerador neste barramento
+            if bus_candidato in rede_pypsa.generators.bus.values:
+                print(f"Já existe um gerador no barramento {bus_candidato} - criando novo barramento conectado")
+
+                # Obter informações do barramento original
+                bus_original = rede_pypsa.buses.loc[bus_candidato]
+
+                # Criar novo nome para o barramento
+                novo_bus_name = f"{bus_candidato}_{nome}"
+
+                # Adicionar novo barramento com mesmas características
+                rede_pypsa.add("Bus",
+                               name=novo_bus_name,
+                               v_nom=bus_original['v_nom'],
+                               v_mag_pu_set=1.0,
+                               x=bus_original['x'],
+                               y=bus_original['y'],
+                               substation=bus_original.get('substation', ''),
+                               geometry=bus_original.get('geometry', None))
+
+                # Adicionar transformador entre os barramentos
+                rede_pypsa.add("Transformer",
+                               name=f"Trafo_{bus_candidato}_to_{novo_bus_name}",
+                               bus0=bus_candidato,
+                               bus1=novo_bus_name,
+                               model="t",
+                               r=0.0005,
+                               x=0.01,
+                               b=0.05,
+                               g=0)
+
+                # Usar o novo barramento para o gerador
+                bus_candidato = novo_bus_name
+
+            # Parâmetros do gerador
+            generator_params = {
+                'name': nome,
+                'bus': bus_candidato,
+                'p_nom': potencia * 0.92,  # Considerando fator de capacidade
+                'q_set': potencia * 0.39,  # Valor de exemplo para reativo
+                'control': "Slack" if "Paulo Afonso I" in nome else "PV",
+                'type': fonte,
+                'p_max_pu': 1,
+                'subsistema': subsist
+            }
+
+            # Configurações especiais para eólicas (UEE)
+            if fonte == 'UEE':
+                generator_params.update({
+                    'p_min_pu': 0,  # Eólicas podem ter geração zero
+                    'p_max_pu': 1
+                })
+
+            # Adicionar à rede
+            rede_pypsa.add("Generator", **generator_params)
+            print(f"Gerador {nome} conectado ao barramento {bus_candidato}")
+
+        except Exception as e:
+            print(f"Erro ao conectar gerador {nome}: {str(e)}")
+            continue
+
+    df_geradores=pd.DataFrame(rede_pypsa.generators)
+    df_geradores.to_excel('geradores.xlsx')
+
+    print(f"Processamento concluído. {len(gdf_filtrado)} geradores processados.")
+    print(f"Total de geradores na rede: {len(rede_pypsa.generators)}")
+
+    return rede_pypsa
+
+def conectar_barramentos_mesma_subestacao(rede_pypsa):
+    """
+    Conecta barramentos da mesma subestação com transformadores.
+
+    Parâmetros:
+    ----------
+    rede_pypsa : pypsa.Network
+        Rede PyPSA existente
+
+    Retorna:
+    -------
+    pypsa.Network
+        Rede com transformadores adicionados entre barramentos da mesma subestação
+    """
+
+    # Verificar se existe a coluna 'substation' nos barramentos
+    if 'substation' not in rede_pypsa.buses.columns:
+        print("A rede não possui a coluna 'substation' nos barramentos - nada a conectar")
+        return rede_pypsa
+
+    # Agrupar barramentos por subestação
+    grupos = rede_pypsa.buses.groupby('substation')
+
+    # Contador de transformadores adicionados
+    trafos_adicionados = 0
+
+    for substation_name, group in grupos:
+        # Obter lista de barramentos nesta subestação
+        barramentos = group.index.tolist()
+
+        # Se houver mais de um barramento na mesma subestação
+        if len(barramentos) > 1:
+            # Ordenar por tensão nominal (maior para menor)
+            barramentos_ordenados = sorted(barramentos,
+                                           key=lambda x: rede_pypsa.buses.at[x, 'v_nom'],
+                                           reverse=True)
+
+            # Conectar cada barramento ao barramento de tensão mais alta (primeiro da lista)
+            barramento_principal = barramentos_ordenados[0]
+
+            for bus in barramentos_ordenados[1:]:
+                # Verificar se já existe um transformador conectando esses barramentos
+                trafo_existe = False
+                for _, trafo in rede_pypsa.transformers.iterrows():
+                    if (trafo['bus0'] == barramento_principal and trafo['bus1'] == bus) or \
+                            (trafo['bus0'] == bus and trafo['bus1'] == barramento_principal):
+                        trafo_existe = True
+                        break
+
+                if not trafo_existe:
+                    # Criar nome único para o transformador
+                    trafo_name = f"Trafo_{substation_name}_{rede_pypsa.buses.at[bus, 'v_nom']}kV"
+
+                    # Adicionar transformador
+                    rede_pypsa.add("Transformer",
+                                   name=trafo_name,
+                                   bus0=barramento_principal,
+                                   bus1=bus,
+                                   model="t",
+                                   r=0.005,
+                                   x=0.1,
+                                   b=0.05,
+                                   g=0)
+
+                    trafos_adicionados += 1
+                    print(f"Adicionado transformador {trafo_name} conectando {barramento_principal} e {bus}")
+
+    print(f"Processamento concluído. {trafos_adicionados} transformadores adicionados.")
+    return rede_pypsa
+
+def plotar_mapa_e_geracao(rede_pypsa, gdf_geradores, salvar_imagem=True, nome_imagem='mapa_rede_brasileira.png'):
+    """
+    Plota um mapa do Brasil com linhas de transmissão por tensão e geradoras por tipo,
+    e retorna um dataframe com a geração por tipo para cada subsistema.
+
+    Parâmetros:
+    ----------
+    rede_pypsa : pypsa.Network
+        Rede PyPSA com os dados da rede elétrica
+    gdf_geradores : geopandas.GeoDataFrame
+        GeoDataFrame com os dados dos geradores
+    salvar_imagem : bool, opcional
+        Se True, salva a imagem do mapa (padrão: True)
+    nome_imagem : str, opcional
+        Nome do arquivo de imagem a ser salvo (padrão: 'mapa_rede_brasileira.png')
+
+    Retorna:
+    -------
+    pandas.DataFrame
+        DataFrame com a geração agregada por tipo e subsistema
+    """
+
+    # Configurar o plot
+    plt.figure(figsize=(20, 15))
+    ax = plt.gca()
+
+    # Carregar base do Brasil
+    try:
+        brasil = gpd.read_file(r"C:\Users\pgcs_\PycharmProjects\PyPSA\raw\BR_UF_2021.shp")
+        brasil.plot(ax=ax, color='#f0f0f0', edgecolor='black', linewidth=0.5)
+    except Exception as e:
+        print(f"Erro ao carregar base do Brasil: {e}")
+        # Criar um eixo vazio se não conseguir carregar o mapa
+        ax.set_xlim(-75, -30)
+        ax.set_ylim(-35, 5)
+
+    # 1. Plotar linhas de transmissão por nível de tensão
+    if hasattr(rede_pypsa, 'lines'):
+        # Definir cores e legendas para cada nível de tensão
+        tensoes_cores = {
+            230: ('blue', '230 kV'),
+            345: ('green', '345 kV'),
+            440: ('orange', '440 kV'),
+            500: ('red', '500 kV'),
+            525: ('purple', '525 kV'),
+            'Others': ('gray', 'Others')
+        }
+
+        for idx, linha in rede_pypsa.lines.iterrows():
+            try:
+                # Obter barramentos conectados
+                bus0 = rede_pypsa.buses.loc[linha.bus0]
+                bus1 = rede_pypsa.buses.loc[linha.bus1]
+
+                # Obter coordenadas
+                x0, y0 = bus0.geometry.x, bus0.geometry.y
+                x1, y1 = bus1.geometry.x, bus1.geometry.y
+
+                # Determinar cor baseada na tensão nominal
+                v_nom = linha.v_nom if hasattr(linha, 'v_nom') else None
+                if v_nom in tensoes_cores:
+                    cor, legenda = tensoes_cores[v_nom]
+                else:
+                    cor, legenda = tensoes_cores['outros']
+
+                # Plotar linha
+                ax.plot([x0, x1], [y0, y1], color=cor, linewidth=1, alpha=0.7)
+
+            except Exception as e:
+                print(f"Erro ao plotar linha {idx}: {e}")
+
+    # 2. Plotar geradoras por tipo
+    if gdf_geradores is not None and not gdf_geradores.empty:
+        # Definir cores e marcadores para cada tipo de gerador
+        geradores_estilos = {
+            'UHE': ('blue', '^', 'UHE'),
+            'UTE': ('red', 's', 'UTE'),
+            'UEE': ('green', 'o', 'UEE'),
+            'UFV': ('yellow', '*', 'UFV'),
+            'Others': ('gray', 'x', 'Others')
+        }
+
+        for idx, gerador in gdf_geradores.iterrows():
+            try:
+                # Obter geometria do gerador
+                if hasattr(gerador, 'geometry'):
+                    geom = gerador.geometry
+                    x, y = geom.x, geom.y
+                else:
+                    continue
+
+                # Determinar estilo baseado no tipo
+                fonte = gerador.get('fonte_original', 'outros')
+                if fonte in geradores_estilos:
+                    cor, marcador, legenda = geradores_estilos[fonte]
+                else:
+                    cor, marcador, legenda = geradores_estilos['outros']
+
+                # Plotar gerador
+                ax.scatter(x, y, color=cor, marker=marcador, s=50, alpha=0.8, edgecolors='black')
+
+            except Exception as e:
+                print(f"Erro ao plotar gerador {idx}: {e}")
+
+    # 3. Criar legendas
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    # Legendas para linhas de transmissão
+    legendas_linhas = [Line2D([0], [0], color=cor, lw=2, label=legenda)
+                       for cor, legenda in tensoes_cores.values()]
+
+    # Legendas para geradores
+    legendas_geradores = [Line2D([0], [0], color=cor, marker=marker, linestyle='None',
+                                 markersize=8, label=legenda)
+                          for cor, marker, legenda in geradores_estilos.values()]
+
+    # Adicionar legendas ao plot
+    ax.legend(handles=legendas_linhas + legendas_geradores, loc='upper right', fontsize=10)
+
+    # Configurações do gráfico
+    ax.set_title('Brazilian Electrical Grid - Transmission and Generation', fontsize=16)
+    ax.set_xlabel('Longitude')
+    ax.set_ylabel('Latitude')
+
+    # Salvar imagem se solicitado
+    if salvar_imagem:
+        plt.savefig(nome_imagem, dpi=300, bbox_inches='tight')
+        print(f"Mapa salvo como {nome_imagem}")
+
+    plt.show()
+
+    # 4. Calcular geração por tipo e subsistema
+    if hasattr(rede_pypsa, 'generators') and hasattr(rede_pypsa.buses, 'subsistema'):
+        # Criar DataFrame com informações dos geradores
+        df_geradores = pd.DataFrame(rede_pypsa.generators)
+
+             # Agrupar por tipo e subsistema
+        if 'type' in df_geradores.columns and 'p_nom' in df_geradores.columns:
+            df_geracao = df_geradores.groupby(['type', 'subsistema'])['p_nom'].sum().unstack().fillna(0)
+
+            # Adicionar totais
+            df_geracao['Total'] = df_geracao.sum(axis=1)
+            df_geracao.loc['Total'] = df_geracao.sum(axis=0)
+
+            print("\nGeração por tipo e subsistema (MW):")
+            print(df_geracao)
+
+            return df_geracao
+        else:
+            print("Dados incompletos para calcular geração por subsistema")
+            return None
+    else:
+        print("Rede não contém informações necessárias para cálculo de geração por subsistema")
+        return None
+
+
+network= pypsa.Network()
+substation = {
+    'name': 'SE Abdon Batista',
+    'geometry': Point(-51.072193056999936, -27.57180735999998),
+    'subsistema': 'S'
+}
+network.add("Bus",
+            name='SE Abdon Batista V_525',
+            v_nom=525,
+            v_mag_pu_set=1,
+            geometry=substation['geometry'],
+            substation=substation['name'],
+            subsistema=substation['subsistema'])
 linhas = carregar_LTs()
-linhas = linhas.set_crs(CRS_PROJETADO)
-subestacoes = carregar_SEs()
-subestacoes = subestacoes.set_crs(CRS_PROJETADO)
-geradores = carregar_Geracao()
-geradores = geradores.set_crs(CRS_PROJETADO)
+geracao = carregar_Geracao()
+linhas = extrair_pontos_referencia(linhas)
 
+gdf_processado, network = processar_linhas_e_atualizar_rede(network, linhas)
+network = conectar_barramentos_mesma_subestacao(network)
 
+network = conectar_geradores_a_rede(network, geracao)
+df_geracao = plotar_mapa_e_geracao(network, geracao)
 
+df_geracao.to_excel('dados por subsistema.xlsx')
 
-# Visualizar o resultado
-
-network = pypsa.Network()
-
-adicionar_subestacoes(network, subestacoes)
-
-linhas_conectadas = conectar_linhas_subestacoes(linhas, subestacoes, geradores)
-adicionar_geradores_completo(network, geradores, linhas_conectadas, subestacoes)
-# Visualizar resultados
-print(network.buses)
